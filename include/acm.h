@@ -26,7 +26,8 @@ struct ACMTier {
     double   sub_spacing_hz;     // Subcarrier spacing
     ModOrder mod;
     CodeRate rate;
-    double   frame_window_sec;   // TX frame duration
+    double   frame_window_sec;   // TX frame duration (total, including all passes)
+    int      passes;             // LLR accumulation passes (1 for all tiers except 0)
     std::string description;
 };
 

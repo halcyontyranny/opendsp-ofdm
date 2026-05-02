@@ -51,6 +51,41 @@ private:
 // Return the codec2 LDPC code name best matched to ACM tier_index (0–8).
 std::string fec_code_for_tier(int tier_index);
 
+// Number of LLR accumulation passes for tier_index.
+// Tier 0 (survival) uses 4 passes (≈ +6 dB combining gain); all others use 1.
+int passes_for_tier(int tier_index);
+
+// Soft Chase combiner — accumulates LLRs from N transmissions of the same
+// codeword before calling the LDPC decoder.
+// Call add_pass() with exactly coded_bits() LLRs per pass.
+// add_pass() returns true once num_passes blocks have been accumulated.
+class FECAccumulator {
+public:
+    FECAccumulator(const std::string& code_name, int num_passes);
+
+    // Feed one pass of LLRs.  Returns true when num_passes have been received.
+    bool add_pass(const std::vector<float>& llr);
+
+    // Decode the accumulated LLRs.  Only valid after add_pass() returns true.
+    // Returns true if all parity checks pass.
+    bool decode(std::vector<uint8_t>& out_bits);
+
+    void reset();  // Discard accumulated LLRs; ready for a new message.
+
+    int passes_remaining() const;
+    int coded_bits()       const;
+    int data_bits()        const;
+
+    // Encode a payload block (delegates to internal codec).
+    std::vector<uint8_t> encode(const std::vector<uint8_t>& payload_bits) const;
+
+private:
+    FECCodec           codec_;
+    int                num_passes_;
+    int                passes_received_;
+    std::vector<float> accum_llr_;
+};
+
 // Byte ↔ flat-bit conversions (MSB first).
 std::vector<uint8_t> bytes_to_bits(const std::vector<uint8_t>& bytes);
 std::vector<uint8_t> bits_to_bytes(const std::vector<uint8_t>& bits);

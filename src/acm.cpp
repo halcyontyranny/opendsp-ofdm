@@ -13,19 +13,24 @@ namespace opendsp {
 //  - 64-QAM removed — unreliable on real HF channels
 //  - 16-QAM only above +6 dB where phase noise is manageable
 //  - BW grows gradually so interference footprint scales with channel quality
+//
+// Tier 0 (survival) uses a 50 Hz channel (FT8-equivalent bandwidth) with
+// H_256_768_22 (rate 1/3) and 4-pass LLR soft combining, giving an effective
+// decode threshold of ≈ −8 dB channel SNR (≈ −25 dB in 2500 Hz reference BW).
+// Code rates in the table match the actual codec2 LDPC codes used.
 
 void ACMEngine::build_tier_table() {
     tiers_ = {
-        //   SNR_thresh  BW_hz   spacing  mod            rate      window  desc
-        { -20.0,   500.0,  6.25,  ModOrder::BPSK,  {1,8},  15.0, "Survival: 500Hz BPSK 1/8"  },
-        { -12.0,   500.0,  6.25,  ModOrder::BPSK,  {1,4},  15.0, "Weak: 500Hz BPSK 1/4"      },
-        {  -8.0,  1000.0,  6.25,  ModOrder::BPSK,  {1,3},  12.0, "Weak+: 1kHz BPSK 1/3"      },
-        {  -5.0,  1500.0,  6.25,  ModOrder::QPSK,  {1,3},  10.0, "Fair: 1.5kHz QPSK 1/3"     },
-        {  -2.0,  2000.0,  6.25,  ModOrder::QPSK,  {1,2},  10.0, "Fair+: 2kHz QPSK 1/2"      },
-        {   1.0,  2500.0,  6.25,  ModOrder::QPSK,  {2,3},   7.5, "Good: 2.5kHz QPSK 2/3"     },
-        {   4.0,  3000.0, 12.5,   ModOrder::PSK8,  {2,3},   7.5, "Good+: 3kHz 8PSK 2/3"      },
-        {   7.0,  3200.0, 12.5,   ModOrder::PSK8,  {3,4},   7.5, "Exc: 3.2kHz 8PSK 3/4"      },
-        {  10.0,  3500.0, 25.0,   ModOrder::QAM16, {3,4},   7.5, "Max: 3.5kHz 16QAM 3/4"     },
+        //   SNR_thresh  BW_hz    spacing  mod             rate      window  passes  desc
+        { -20.0,   50.0,  6.25,  ModOrder::BPSK,  {1,3},  90.0, 4, "Survival: 50Hz BPSK 1/3×4p" },
+        { -12.0,  500.0,  6.25,  ModOrder::BPSK,  {1,3},  15.0, 1, "Weak: 500Hz BPSK 1/3"       },
+        {  -8.0, 1000.0,  6.25,  ModOrder::BPSK,  {1,2},  12.0, 1, "Weak+: 1kHz BPSK 1/2"       },
+        {  -5.0, 1500.0,  6.25,  ModOrder::QPSK,  {1,2},  10.0, 1, "Fair: 1.5kHz QPSK 1/2"      },
+        {  -2.0, 2000.0,  6.25,  ModOrder::QPSK,  {1,2},  10.0, 1, "Fair+: 2kHz QPSK 1/2"       },
+        {   1.0, 2500.0,  6.25,  ModOrder::QPSK,  {1,2},   7.5, 1, "Good: 2.5kHz QPSK 1/2"      },
+        {   4.0, 3000.0, 12.5,   ModOrder::PSK8,  {3,4},   7.5, 1, "Good+: 3kHz 8PSK 3/4"       },
+        {   7.0, 3200.0, 12.5,   ModOrder::PSK8,  {3,4},   7.5, 1, "Exc: 3.2kHz 8PSK 3/4"       },
+        {  10.0, 3500.0, 25.0,   ModOrder::QAM16, {3,4},   7.5, 1, "Max: 3.5kHz 16QAM 3/4"      },
     };
 }
 
@@ -69,7 +74,8 @@ double ACMEngine::compute_throughput(const ACMTier& t) const {
     // Frame overhead: sync word (~0.5 s), ACM header, CRC → ~15% total
     double frame_overhead = 0.15;
 
-    return coded_bps * (1.0 - frame_overhead);
+    // Multi-pass accumulation reduces net data rate proportionally
+    return coded_bps * (1.0 - frame_overhead) / t.passes;
 }
 
 // ── update ────────────────────────────────────────────────────────────────────

@@ -41,9 +41,6 @@ public:
         : acm_(acm), verbose_(verbose) {
         update_params();
         zc_ref_ = zadoff_chu(params_.fft_size / 4);
-#ifdef HAVE_CODEC2
-        fec_ = std::make_unique<FECCodec>(fec_code_for_tier(acm_.state().tier_index));
-#endif
     }
 
     void on_samples(const std::vector<double>& samples) {
@@ -85,23 +82,26 @@ public:
             auto llr = demod_.equalise_and_demap(rx_sc, ch_est_);
 
 #ifdef HAVE_CODEC2
-            // Accumulate soft LLRs; decode complete FEC blocks as they arrive
-            for (auto v : llr) llr_buf_.push_back(static_cast<float>(v));
-            while (fec_ && static_cast<int>(llr_buf_.size()) >= fec_->coded_bits()) {
-                std::vector<float> block_llr(llr_buf_.begin(),
-                                             llr_buf_.begin() + fec_->coded_bits());
-                llr_buf_.erase(llr_buf_.begin(),
-                               llr_buf_.begin() + fec_->coded_bits());
-                std::vector<uint8_t> decoded_bits;
-                bool parity_ok = fec_->decode(block_llr, decoded_bits);
-                auto decoded_bytes = bits_to_bytes(decoded_bits);
-                Framer framer;
-                Frame  frame = framer.parse(decoded_bytes);
-                if (frame.crc_ok) {
-                    std::cout << "\n[RX] " << frame.callsign << ": ";
-                    for (auto b : frame.payload)
-                        std::cout << static_cast<char>(b);
-                    std::cout << " [FEC:" << (parity_ok ? "OK" : "err") << "]\n";
+            // Collect LLRs pass-by-pass; decode after num_passes complete passes
+            for (auto v : llr) pass_llrs_.push_back(static_cast<float>(v));
+            while (accum_ && static_cast<int>(pass_llrs_.size()) >= accum_->coded_bits()) {
+                std::vector<float> one_pass(pass_llrs_.begin(),
+                                            pass_llrs_.begin() + accum_->coded_bits());
+                pass_llrs_.erase(pass_llrs_.begin(),
+                                 pass_llrs_.begin() + accum_->coded_bits());
+                if (accum_->add_pass(one_pass)) {
+                    std::vector<uint8_t> decoded_bits;
+                    bool parity_ok = accum_->decode(decoded_bits);
+                    accum_->reset();
+                    auto decoded_bytes = bits_to_bytes(decoded_bits);
+                    Framer framer;
+                    Frame  frame = framer.parse(decoded_bytes);
+                    if (frame.crc_ok) {
+                        std::cout << "\n[RX] " << frame.callsign << ": ";
+                        for (auto b : frame.payload)
+                            std::cout << static_cast<char>(b);
+                        std::cout << " [FEC:" << (parity_ok ? "OK" : "err") << "]\n";
+                    }
                 }
             }
 #else
@@ -140,8 +140,8 @@ private:
     RealVec         sample_buf_;
     int             sym_count_ = 0;
 #ifdef HAVE_CODEC2
-    std::unique_ptr<FECCodec> fec_;
-    std::vector<float>        llr_buf_;
+    std::unique_ptr<FECAccumulator> accum_;
+    std::vector<float>              pass_llrs_;
 #endif
 
     void update_params() {
@@ -149,8 +149,10 @@ private:
         demod_  = OFDMDemodulator(params_);
         zc_ref_ = zadoff_chu(params_.fft_size / 4);
 #ifdef HAVE_CODEC2
-        fec_ = std::make_unique<FECCodec>(fec_code_for_tier(acm_.state().tier_index));
-        llr_buf_.clear();
+        int tier = acm_.state().tier_index;
+        accum_ = std::make_unique<FECAccumulator>(fec_code_for_tier(tier),
+                                                   passes_for_tier(tier));
+        pass_llrs_.clear();
 #endif
     }
 };
@@ -179,7 +181,8 @@ std::vector<double> build_tx_frame(const std::string& text,
 #ifdef HAVE_CODEC2
     bits = bytes_to_bits(raw_bytes);
 
-    // FEC encode: pad to block boundary then encode each block
+    // FEC encode: pad to block boundary, encode each block, repeat num_passes times
+    int num_passes = passes_for_tier(acm.state().tier_index);
     FECCodec fec(fec_code_for_tier(acm.state().tier_index));
     auto padded = fec.pad_to_block(bits);
     bits.clear();
@@ -187,7 +190,8 @@ std::vector<double> build_tx_frame(const std::string& text,
         std::vector<uint8_t> block(padded.begin() + off,
                                     padded.begin() + off + fec.data_bits());
         auto codeword = fec.encode(block);
-        bits.insert(bits.end(), codeword.begin(), codeword.end());
+        for (int p = 0; p < num_passes; p++)
+            bits.insert(bits.end(), codeword.begin(), codeword.end());
     }
 #else
     for (uint8_t byte : raw_bytes)
@@ -286,16 +290,16 @@ int main(int argc, char* argv[]) {
 "  --verbose        Print per-symbol SNR and ACM status during RX\n"
 "\n"
 "ACM tiers  (0 = most robust / lowest rate, 8 = fastest / highest SNR required)\n"
-"  Tier  Modulation     BW      Code rate  ~Rate    Min SNR\n"
-"  0     BPSK           500 Hz  1/8        30 bps   -20 dB\n"
-"  1     BPSK           500 Hz  1/4        60 bps   -12 dB\n"
-"  2     BPSK           1 kHz   1/3       177 bps    -8 dB\n"
-"  3     QPSK           1.5 kHz 1/3       531 bps    -5 dB\n"
-"  4     QPSK           2 kHz   1/2       1.1 kbps   -2 dB\n"
-"  5     QPSK           2.5 kHz 2/3       1.8 kbps   +1 dB\n"
-"  6     8-PSK          3 kHz   2/3       3.2 kbps   +4 dB\n"
-"  7     8-PSK          3.2 kHz 3/4       3.8 kbps   +7 dB\n"
-"  8     16-QAM         3.5 kHz 3/4       5.6 kbps  +10 dB\n"
+"  Tier  Modulation  BW       Code rate     ~Rate    Min SNR   Notes\n"
+"  0     BPSK        50 Hz    1/3 × 4pass   ~2 bps   -20 dB   FT8-like; ≈-25dB 2500Hz ref\n"
+"  1     BPSK        500 Hz   1/3           ~20 bps  -12 dB\n"
+"  2     BPSK        1 kHz    1/2          ~100 bps   -8 dB\n"
+"  3     QPSK        1.5 kHz  1/2          ~300 bps   -5 dB\n"
+"  4     QPSK        2 kHz    1/2          ~500 bps   -2 dB\n"
+"  5     QPSK        2.5 kHz  1/2          ~700 bps   +1 dB\n"
+"  6     8-PSK       3 kHz    3/4         ~2.5 kbps   +4 dB\n"
+"  7     8-PSK       3.2 kHz  3/4         ~3.0 kbps   +7 dB\n"
+"  8     16-QAM      3.5 kHz  3/4         ~4.5 kbps  +10 dB\n"
 "\n"
 "Examples:\n"
 "  opendsp_ofdm --call W1AW --tx \"Hello\"\n"

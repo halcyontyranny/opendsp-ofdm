@@ -107,10 +107,49 @@ std::vector<uint8_t> FECCodec::pad_to_block(const std::vector<uint8_t>& bits) co
 // ── Code selection ────────────────────────────────────────────────────────────
 
 std::string fec_code_for_tier(int tier_index) {
-    if (tier_index <= 1) return "H_256_768_22";   // rate 1/4: 256 data, 1024 coded
-    if (tier_index <= 3) return "H_128_256_5";    // rate 1/3: 128 data,  384 coded
+    if (tier_index <= 1) return "H_256_768_22";   // rate 1/3: 256 data,  768 coded
+    if (tier_index <= 3) return "H_128_256_5";    // rate 1/2: 128 data,  256 coded
     if (tier_index <= 5) return "HRA_112_112";    // rate 1/2: 112 data,  224 coded
     return                      "HRAa_1536_512";  // rate 3/4: 1536 data, 2048 coded
+}
+
+int passes_for_tier(int tier_index) {
+    return (tier_index == 0) ? 4 : 1;
+}
+
+// ── FECAccumulator ────────────────────────────────────────────────────────────
+
+FECAccumulator::FECAccumulator(const std::string& code_name, int num_passes)
+    : codec_(code_name),
+      num_passes_(num_passes),
+      passes_received_(0),
+      accum_llr_(codec_.coded_bits(), 0.0f) {}
+
+bool FECAccumulator::add_pass(const std::vector<float>& llr) {
+    if (static_cast<int>(llr.size()) != codec_.coded_bits())
+        throw std::invalid_argument(
+            "FECAccumulator: expected " + std::to_string(codec_.coded_bits()) +
+            " LLRs, got " + std::to_string(llr.size()));
+    for (int i = 0; i < codec_.coded_bits(); i++)
+        accum_llr_[i] += llr[i];
+    return ++passes_received_ >= num_passes_;
+}
+
+bool FECAccumulator::decode(std::vector<uint8_t>& out_bits) {
+    return codec_.decode(accum_llr_, out_bits);
+}
+
+void FECAccumulator::reset() {
+    passes_received_ = 0;
+    std::fill(accum_llr_.begin(), accum_llr_.end(), 0.0f);
+}
+
+int FECAccumulator::passes_remaining() const { return num_passes_ - passes_received_; }
+int FECAccumulator::coded_bits()       const { return codec_.coded_bits(); }
+int FECAccumulator::data_bits()        const { return codec_.data_bits(); }
+
+std::vector<uint8_t> FECAccumulator::encode(const std::vector<uint8_t>& payload_bits) const {
+    return codec_.encode(payload_bits);
 }
 
 // ── Byte ↔ bit helpers ────────────────────────────────────────────────────────
