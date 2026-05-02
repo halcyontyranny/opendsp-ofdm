@@ -344,13 +344,18 @@ int main(int argc, char* argv[]) {
         audio.set_ptt(true);
         audio.start();
         audio.queue_tx(samples);
-        // Wait for TX queue to drain
-        std::this_thread::sleep_for(
+        // Wait for TX queue to drain, polling so Ctrl-C is responsive
+        auto deadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds(
-                static_cast<int>(samples.size() / SAMPLE_RATE * 1100)));
+                static_cast<int>(samples.size() / SAMPLE_RATE * 1100));
+        while (g_running && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         audio.set_ptt(false);
         audio.stop();
-        std::cout << "[TX] Done.\n";
+        if (g_running)
+            std::cout << "[TX] Done.\n";
+        else
+            std::cout << "\n[TX] Interrupted.\n";
     } else if (do_rx) {
         // RX mode
         RXPipeline rx(acm, verbose);
