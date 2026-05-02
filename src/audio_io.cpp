@@ -53,15 +53,30 @@ AudioIO::~AudioIO() {
 }
 
 void AudioIO::list_devices() {
+    PaError err = Pa_Initialize();
+    if (err != paNoError) {
+        std::cerr << "PortAudio init failed: " << Pa_GetErrorText(err) << "\n";
+        return;
+    }
+
     int n = Pa_GetDeviceCount();
-    std::cout << "PortAudio devices:\n";
+    PaDeviceIndex def_in  = Pa_GetDefaultInputDevice();
+    PaDeviceIndex def_out = Pa_GetDefaultOutputDevice();
+
+    std::cout << "PortAudio devices (" << n << " found):\n";
     for (int i = 0; i < n; i++) {
         const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
+        std::string flags;
+        if (i == def_in)  flags += " [default in]";
+        if (i == def_out) flags += " [default out]";
         std::cout << "  [" << i << "] " << info->name
                   << "  in=" << info->maxInputChannels
                   << " out=" << info->maxOutputChannels
-                  << " sr=" << info->defaultSampleRate << "\n";
+                  << " sr=" << info->defaultSampleRate
+                  << flags << "\n";
     }
+
+    Pa_Terminate();
 }
 
 bool AudioIO::open(int input_device, int output_device, int block_size) {

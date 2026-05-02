@@ -27,6 +27,17 @@ if(WITH_HAMLIB)
   endif()
 endif()
 
+option(WITH_CODEC2 "Enable codec2 LDPC FEC support" ON)
+if(WITH_CODEC2)
+  pkg_check_modules(CODEC2 codec2)
+  if(CODEC2_FOUND)
+    add_compile_definitions(HAVE_CODEC2)
+    message(STATUS "codec2 found — LDPC FEC enabled")
+  else()
+    message(WARNING "codec2 not found — building without LDPC FEC")
+  endif()
+endif()
+
 # ── Library ───────────────────────────────────────────────────────────────────
 set(LIB_SOURCES
     src/ofdm_core.cpp
@@ -35,10 +46,14 @@ set(LIB_SOURCES
     src/negotiation.cpp
     src/audio_io.cpp
 )
+if(WITH_CODEC2 AND CODEC2_FOUND)
+  list(APPEND LIB_SOURCES src/fec.cpp)
+endif()
 
 add_library(opendsp_ofdm_lib STATIC ${LIB_SOURCES})
 target_include_directories(opendsp_ofdm_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     ${FFTW3_INCLUDE_DIRS}
     ${PORTAUDIO_INCLUDE_DIRS}
 )
@@ -49,6 +64,10 @@ target_link_libraries(opendsp_ofdm_lib PUBLIC
 if(WITH_HAMLIB AND HAMLIB_FOUND)
   target_include_directories(opendsp_ofdm_lib PUBLIC ${HAMLIB_INCLUDE_DIRS})
   target_link_libraries(opendsp_ofdm_lib PUBLIC ${HAMLIB_LIBRARIES})
+endif()
+if(WITH_CODEC2 AND CODEC2_FOUND)
+  target_include_directories(opendsp_ofdm_lib PUBLIC ${CODEC2_INCLUDE_DIRS})
+  target_link_libraries(opendsp_ofdm_lib PUBLIC ${CODEC2_LIBRARIES})
 endif()
 
 # ── Executables ───────────────────────────────────────────────────────────────

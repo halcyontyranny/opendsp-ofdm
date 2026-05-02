@@ -11,6 +11,7 @@
 //   --verbose        Extra diagnostic output
 
 #include <iostream>
+#include <iomanip>
 #include <string>
 #include <csignal>
 #include <atomic>
@@ -21,6 +22,10 @@
 #include "framer.h"
 #include "negotiation.h"
 #include "audio_io.h"
+#ifdef HAVE_CODEC2
+#include "fec.h"
+#include <memory>
+#endif
 
 using namespace opendsp;
 
@@ -36,6 +41,9 @@ public:
         : acm_(acm), verbose_(verbose) {
         update_params();
         zc_ref_ = zadoff_chu(params_.fft_size / 4);
+#ifdef HAVE_CODEC2
+        fec_ = std::make_unique<FECCodec>(fec_code_for_tier(acm_.state().tier_index));
+#endif
     }
 
     void on_samples(const std::vector<double>& samples) {
@@ -76,9 +84,32 @@ public:
             demod_.update_channel_estimate(rx_sc, sym_count_, ch_est_);
             auto llr = demod_.equalise_and_demap(rx_sc, ch_est_);
 
-            // Hard decision bits
+#ifdef HAVE_CODEC2
+            // Accumulate soft LLRs; decode complete FEC blocks as they arrive
+            for (auto v : llr) llr_buf_.push_back(static_cast<float>(v));
+            while (fec_ && static_cast<int>(llr_buf_.size()) >= fec_->coded_bits()) {
+                std::vector<float> block_llr(llr_buf_.begin(),
+                                             llr_buf_.begin() + fec_->coded_bits());
+                llr_buf_.erase(llr_buf_.begin(),
+                               llr_buf_.begin() + fec_->coded_bits());
+                std::vector<uint8_t> decoded_bits;
+                bool parity_ok = fec_->decode(block_llr, decoded_bits);
+                auto decoded_bytes = bits_to_bytes(decoded_bits);
+                Framer framer;
+                Frame  frame = framer.parse(decoded_bytes);
+                if (frame.crc_ok) {
+                    std::cout << "\n[RX] " << frame.callsign << ": ";
+                    for (auto b : frame.payload)
+                        std::cout << static_cast<char>(b);
+                    std::cout << " [FEC:" << (parity_ok ? "OK" : "err") << "]\n";
+                }
+            }
+#else
+            // Hard decision bits (no FEC build)
             std::vector<uint8_t> bits;
             for (auto l : llr) bits.push_back(l < 0.0 ? 1 : 0);
+            (void)bits;
+#endif
 
             // Feed SNR to ACM
             bool tier_changed = acm_.update(ch_est_.snr_db, 0.0 /* BER TBD */);
@@ -108,12 +139,19 @@ private:
     CxVec           zc_ref_;
     RealVec         sample_buf_;
     int             sym_count_ = 0;
+#ifdef HAVE_CODEC2
+    std::unique_ptr<FECCodec> fec_;
+    std::vector<float>        llr_buf_;
+#endif
 
     void update_params() {
         params_ = acm_.current_params();
-        // Re-construct demodulator with new params
         demod_  = OFDMDemodulator(params_);
         zc_ref_ = zadoff_chu(params_.fft_size / 4);
+#ifdef HAVE_CODEC2
+        fec_ = std::make_unique<FECCodec>(fec_code_for_tier(acm_.state().tier_index));
+        llr_buf_.clear();
+#endif
     }
 };
 
@@ -136,13 +174,28 @@ std::vector<double> build_tx_frame(const std::string& text,
 
     auto raw_bytes = framer.build(f);
 
-    // Convert bytes to bits
+    // Convert bytes to bits (MSB first)
     std::vector<uint8_t> bits;
+#ifdef HAVE_CODEC2
+    bits = bytes_to_bits(raw_bytes);
+
+    // FEC encode: pad to block boundary then encode each block
+    FECCodec fec(fec_code_for_tier(acm.state().tier_index));
+    auto padded = fec.pad_to_block(bits);
+    bits.clear();
+    for (int off = 0; off < static_cast<int>(padded.size()); off += fec.data_bits()) {
+        std::vector<uint8_t> block(padded.begin() + off,
+                                    padded.begin() + off + fec.data_bits());
+        auto codeword = fec.encode(block);
+        bits.insert(bits.end(), codeword.begin(), codeword.end());
+    }
+#else
     for (uint8_t byte : raw_bytes)
         for (int b = 7; b >= 0; b--)
             bits.push_back((byte >> b) & 1);
+#endif
 
-    // Pad to full number of data subcarriers
+    // Pad coded bit stream to fill an integer number of OFDM symbols
     int data_sc = params.num_subcarriers - params.num_subcarriers / params.pilot_interval;
     int bits_per_sym = data_sc * params.bits_per_symbol;
     while (static_cast<int>(bits.size()) % bits_per_sym != 0) bits.push_back(0);
@@ -213,9 +266,42 @@ int main(int argc, char* argv[]) {
         else if (a == "--tier"    && i+1 < argc) force_tier = std::stoi(argv[++i]);
         else if (a == "--verbose")               verbose    = true;
         else if (a == "--help") {
-            std::cout << "Usage: opendsp_ofdm [--call SIGN] [--tx TEXT] [--rx]\n"
-                         "                    [--in N] [--out N] [--list-devices]\n"
-                         "                    [--snr F] [--tier N] [--verbose]\n";
+            std::cout <<
+"opendsp_ofdm — Adaptive HF OFDM Modem\n"
+"\n"
+"Usage:\n"
+"  opendsp_ofdm --call SIGN --tx TEXT   Transmit a message\n"
+"  opendsp_ofdm --call SIGN --rx        Receive mode (Ctrl-C to stop)\n"
+"  opendsp_ofdm --list-devices          List audio device indices\n"
+"\n"
+"Options:\n"
+"  --call SIGN      Callsign to embed in frames (default: N0CALL)\n"
+"  --tx TEXT        Text message to transmit\n"
+"  --rx             Enter receive / decode mode\n"
+"  --list-devices   Print available audio input/output device indices\n"
+"  --in  N          Audio input device index  (default: system default)\n"
+"  --out N          Audio output device index (default: system default)\n"
+"  --tier N         Lock ACM to tier N (0–8) instead of adapting\n"
+"  --snr F          Offline mode: simulate channel at F dB, no audio I/O\n"
+"  --verbose        Print per-symbol SNR and ACM status during RX\n"
+"\n"
+"ACM tiers  (0 = most robust / lowest rate, 8 = fastest / highest SNR required)\n"
+"  Tier  Modulation     BW      Code rate  ~Rate    Min SNR\n"
+"  0     BPSK           500 Hz  1/8        30 bps   -20 dB\n"
+"  1     BPSK           500 Hz  1/4        60 bps   -12 dB\n"
+"  2     BPSK           1 kHz   1/3       177 bps    -8 dB\n"
+"  3     QPSK           1.5 kHz 1/3       531 bps    -5 dB\n"
+"  4     QPSK           2 kHz   1/2       1.1 kbps   -2 dB\n"
+"  5     QPSK           2.5 kHz 2/3       1.8 kbps   +1 dB\n"
+"  6     8-PSK          3 kHz   2/3       3.2 kbps   +4 dB\n"
+"  7     8-PSK          3.2 kHz 3/4       3.8 kbps   +7 dB\n"
+"  8     16-QAM         3.5 kHz 3/4       5.6 kbps  +10 dB\n"
+"\n"
+"Examples:\n"
+"  opendsp_ofdm --call W1AW --tx \"Hello\"\n"
+"  opendsp_ofdm --call W1AW --rx --verbose\n"
+"  opendsp_ofdm --call W1AW --tx \"Hello\" --snr 5.0   # offline preview\n"
+"  opendsp_ofdm --list-devices\n";
             return 0;
         }
     }

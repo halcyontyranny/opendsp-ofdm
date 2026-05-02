@@ -113,7 +113,7 @@ void NegotiationManager::handle_probe(const Frame& f) {
 }
 
 void NegotiationManager::handle_ack(const Frame& f) {
-    if (state_ != NegState::PROBING) return;
+    if (state_ != NegState::PROBING && state_ != NegState::RETUNING) return;
 
     int agreed = static_cast<int>(f.header.tier_index);
     // Sanity: take the lower of what peer says and what we support
@@ -159,22 +159,17 @@ void NegotiationManager::handle_nak(const Frame& f) {
 // ── Tier negotiation logic ────────────────────────────────────────────────────
 
 int NegotiationManager::negotiate_tier(int peer_max_tier) const {
-    // Current SNR-based best tier
-    int our_snr_tier = acm_.state().tier_index;
+    double snr  = acm_.state().current_snr_db;
+    int    upper = std::min(peer_max_tier, acm_.num_tiers() - 1);
 
-    // Can't exceed peer's capability
-    int upper = std::min(peer_max_tier, acm_.num_tiers() - 1);
-
-    // Choose the best tier ≤ upper that current SNR supports
     int best = 0;
     for (int i = upper; i >= 0; i--) {
-        if (last_snr_db_ >= acm_.tier(i).snr_threshold_db) {
+        if (snr >= acm_.tier(i).snr_threshold_db) {
             best = i;
             break;
         }
     }
-    // Conservative: take the min of SNR-based and upper bound
-    return std::min(best, our_snr_tier);
+    return best;
 }
 
 std::string NegotiationManager::state_str() const {

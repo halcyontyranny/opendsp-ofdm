@@ -2,9 +2,12 @@
 // No radio or soundcard required.
 //
 // Usage:
-//   ./sim_test               # run BER sweep across all tiers
-//   ./sim_test --snr 3.5     # test at a specific SNR
-//   ./sim_test --tier 5      # force a specific ACM tier
+//   ./sim_test                        # BER sweep: each tier tested at its own threshold SNR
+//   ./sim_test --channel-tier 7       # BER sweep: all tiers tested at tier-7 channel SNR
+//   ./sim_test --tier 5               # single tier at its own threshold SNR
+//   ./sim_test --tier 5 --channel-tier 7  # tier-5 modem under tier-7 channel conditions
+//   ./sim_test --snr 3.5              # explicit SNR (overrides --channel-tier)
+//   ./sim_test --seed 42              # fix RNG seed for reproducibility
 
 #include <iostream>
 #include <iomanip>
@@ -13,16 +16,28 @@
 #include <cmath>
 #include <string>
 #include <sstream>
+#include <fstream>
+#include <cstdint>
 #include "ofdm_core.h"
 #include "acm.h"
 #include "framer.h"
 #include "negotiation.h"
+#ifdef HAVE_CODEC2
+#include "fec.h"
+#endif
 
 using namespace opendsp;
 
 // ── AWGN channel ──────────────────────────────────────────────────────────────
 
-static std::mt19937_64 rng(42);
+static std::mt19937_64 rng;
+
+static uint64_t read_urandom_seed() {
+    uint64_t seed = 0;
+    std::ifstream f("/dev/urandom", std::ios::binary);
+    f.read(reinterpret_cast<char*>(&seed), sizeof(seed));
+    return seed;
+}
 
 // Add AWGN to a real sample vector.  snr_db is per-subcarrier SNR.
 RealVec add_awgn(const RealVec& signal, double snr_db) {
@@ -57,7 +72,6 @@ BERResult run_ber_test(int tier_idx, double snr_db, int num_symbols = 500) {
 
     OFDMModulator   mod(p);
     OFDMDemodulator demod(p);
-    Framer          framer;
 
     int  total_bits  = 0;
     int  bit_errors  = 0;
@@ -106,7 +120,7 @@ BERResult run_ber_test(int tier_idx, double snr_db, int num_symbols = 500) {
         for (int i = 0; i < p.num_subcarriers; i++) {
             if (i % p.pilot_interval == 0) continue;
             for (int b = 0; b < p.bits_per_symbol; b++) {
-                int ref_bit_idx = (i - i/p.pilot_interval) * p.bits_per_symbol + b;
+                int ref_bit_idx = (i - (i + p.pilot_interval - 1) / p.pilot_interval) * p.bits_per_symbol + b;
                 // Guard against going out of bounds
                 if (ref_bit_idx >= static_cast<int>(tx_bits.size())) break;
                 if (llr_idx >= static_cast<int>(llr.size())) break;
@@ -126,6 +140,112 @@ BERResult run_ber_test(int tier_idx, double snr_db, int num_symbols = 500) {
     r.throughput_bps = acm.estimated_throughput_bps();
     return r;
 }
+
+// ── FEC-aware BER test ────────────────────────────────────────────────────────
+
+#ifdef HAVE_CODEC2
+struct FECBERResult {
+    int    tier;
+    double snr_db;
+    double raw_ber;
+    double fec_ber;
+    int    blocks_tested;
+};
+
+FECBERResult run_fec_ber_test(int tier_idx, double snr_db, int num_blocks = 50) {
+    ACMEngine acm;
+    acm.force_tier(tier_idx);
+    OFDMParams p = acm.current_params();
+
+    FECCodec        fec(fec_code_for_tier(tier_idx));
+    OFDMModulator   mod(p);
+    OFDMDemodulator demod(p);
+    ChannelEstimate ch_est;
+
+    int db = fec.data_bits();
+    int cb = fec.coded_bits();
+
+    // Data bits carried per OFDM symbol
+    int data_sc = 0;
+    for (int i = 0; i < p.num_subcarriers; i++)
+        if (i % p.pilot_interval != 0) data_sc++;
+    int bits_per_sym = data_sc * p.bits_per_symbol;
+
+    // Symbols needed to carry one FEC block (may carry a few padding bits)
+    int syms_per_block   = (cb + bits_per_sym - 1) / bits_per_sym;
+    int bits_capacity    = syms_per_block * bits_per_sym;
+
+    int raw_bits = 0, raw_errors = 0;
+    int fec_bits = 0, fec_errors = 0;
+
+    std::uniform_int_distribution<int> bit_dist(0, 1);
+
+    for (int blk = 0; blk < num_blocks; blk++) {
+        // Random payload → encode
+        std::vector<uint8_t> payload(db);
+        for (auto& b : payload) b = bit_dist(rng);
+        auto coded     = fec.encode(payload);
+        auto coded_ref = coded;                   // keep original cb bits for raw-BER count
+        coded.resize(bits_capacity, 0);           // zero-pad to fill an integer number of symbols
+
+        // Transmit syms_per_block OFDM symbols, collect LLRs
+        std::vector<float> all_llrs;
+        all_llrs.reserve(bits_capacity);
+
+        int bit_offset = 0;
+        for (int sym = 0; sym < syms_per_block; sym++) {
+            CxVec tx_sc(p.num_subcarriers);
+            for (int i = 0; i < p.num_subcarriers; i++) {
+                if (i % p.pilot_interval == 0) {
+                    tx_sc[i] = cx(1, 0);
+                } else {
+                    uint8_t sym_bits = 0;
+                    for (int b = 0; b < p.bits_per_symbol; b++) {
+                        int bidx = bit_offset + b;
+                        uint8_t bit = (bidx < (int)coded.size()) ? coded[bidx] : 0;
+                        sym_bits |= (bit & 1) << (p.bits_per_symbol - 1 - b);
+                    }
+                    tx_sc[i] = map_symbol(sym_bits, p.bits_per_symbol);
+                    bit_offset += p.bits_per_symbol;
+                }
+            }
+            mod.insert_pilots(tx_sc, sym);
+
+            RealVec tx_samples = mod.modulate_symbol(tx_sc);
+            RealVec rx_samples = add_awgn(tx_samples, snr_db);
+            CxVec   rx_sc      = demod.demodulate_symbol(rx_samples);
+            demod.update_channel_estimate(rx_sc, sym, ch_est);
+            auto llr = demod.equalise_and_demap(rx_sc, ch_est);
+            for (auto v : llr) all_llrs.push_back(static_cast<float>(v));
+        }
+
+        // Truncate to exactly cb LLRs (discard padding)
+        all_llrs.resize(cb);
+
+        // Raw (pre-FEC) hard-decision errors against the coded reference
+        for (int i = 0; i < cb; i++) {
+            if (((all_llrs[i] < 0.0f) ? 1 : 0) != coded_ref[i]) raw_errors++;
+            raw_bits++;
+        }
+
+        // Soft FEC decode, count errors on recovered payload
+        std::vector<uint8_t> decoded;
+        fec.decode(all_llrs, decoded);
+        for (int i = 0; i < db; i++) {
+            if (decoded[i] != payload[i]) fec_errors++;
+            fec_bits++;
+        }
+    }
+
+    FECBERResult r;
+    r.tier         = tier_idx;
+    r.snr_db       = snr_db;
+    r.raw_ber      = raw_bits > 0  ? static_cast<double>(raw_errors) / raw_bits : 0.5;
+    r.fec_ber      = fec_bits > 0  ? static_cast<double>(fec_errors) / fec_bits : 0.5;
+    r.blocks_tested = num_blocks;
+    return r;
+}
+#endif // HAVE_CODEC2
 
 // ── Negotiation smoke test ────────────────────────────────────────────────────
 
@@ -172,7 +292,6 @@ void run_negotiation_test() {
               << " agreed_tier=" << neg_b.agreed_tier() << "\n";
 
     // Simulate SNR degradation → B sends RETUNE
-    acm_b.update(-9.0, 0.05);
     neg_b.on_snr_update(-9.0);
     for (auto& f : ba_wire) neg_a.on_frame_received(f);
     ba_wire.clear();
@@ -186,44 +305,128 @@ void run_negotiation_test() {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
-    double force_snr  = -999;
-    int    force_tier = -1;
+    double   force_snr      = -999;
+    int      force_tier     = -1;
+    int      channel_tier   = -1;
+    int64_t  force_seed     = -1;
+    bool     no_fec         = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg(argv[i]);
-        if (arg == "--snr"  && i+1 < argc) force_snr  = std::stod(argv[++i]);
-        if (arg == "--tier" && i+1 < argc) force_tier = std::stoi(argv[++i]);
+        if (arg == "--snr"          && i+1 < argc) force_snr    = std::stod(argv[++i]);
+        if (arg == "--tier"         && i+1 < argc) force_tier   = std::stoi(argv[++i]);
+        if (arg == "--channel-tier" && i+1 < argc) channel_tier = std::stoi(argv[++i]);
+        if (arg == "--seed"         && i+1 < argc) force_seed   = std::stoll(argv[++i]);
+        if (arg == "--no-fec")                     no_fec       = true;
+        if (arg == "--help") {
+            std::cout <<
+"sim_test — OpenDSP-OFDM offline BER/SNR simulator\n"
+"\n"
+"Usage:\n"
+"  sim_test [options]\n"
+"\n"
+"Options:\n"
+"  --tier N          Test a single modem tier (0–8) instead of the full sweep\n"
+"  --channel-tier N  Set channel SNR to tier N's nominal operating point\n"
+"                    (threshold + 2 dB). Ignored if --snr is also given.\n"
+"  --snr F           Set channel SNR to exactly F dB for all tested tiers\n"
+"  --seed N          Fix RNG seed for reproducible results\n"
+"                    (default: seeded from /dev/urandom)\n"
+"  --no-fec          Show raw (pre-FEC) BER only; skip codec2 LDPC decoding\n"
+"  --help            Show this help\n"
+"\n"
+"Channel tiers and their nominal SNR operating points:\n"
+"  Tier  Description              SNR threshold  Test SNR (+2 dB)\n"
+"  0     Survival: 500 Hz BPSK    -20 dB         -18 dB\n"
+"  1     Weak: 500 Hz BPSK 1/4   -12 dB         -10 dB\n"
+"  2     Weak+: 1 kHz BPSK 1/3    -8 dB          -6 dB\n"
+"  3     Fair: 1.5 kHz QPSK 1/3   -5 dB          -3 dB\n"
+"  4     Fair+: 2 kHz QPSK 1/2    -2 dB           0 dB\n"
+"  5     Good: 2.5 kHz QPSK 2/3   +1 dB          +3 dB\n"
+"  6     Good+: 3 kHz 8-PSK 2/3   +4 dB          +6 dB\n"
+"  7     Exc: 3.2 kHz 8-PSK 3/4   +7 dB          +9 dB\n"
+"  8     Max: 3.5 kHz 16-QAM 3/4 +10 dB         +12 dB\n"
+"\n"
+"Examples:\n"
+"  sim_test                              Full sweep, each tier at its own SNR\n"
+"  sim_test --channel-tier 7             Full sweep at tier-7 conditions (9 dB)\n"
+"  sim_test --tier 7                     Tier-7 modem at tier-7 channel SNR\n"
+"  sim_test --tier 8 --channel-tier 7   Tier-8 modem under tier-7 conditions\n"
+"  sim_test --snr 5.0 --tier 6          Tier-6 modem at exactly 5.0 dB\n"
+"  sim_test --seed 42                    Reproducible run with fixed seed\n";
+            return 0;
+        }
     }
+
+    uint64_t seed = (force_seed >= 0) ? static_cast<uint64_t>(force_seed)
+                                      : read_urandom_seed();
+    rng.seed(seed);
 
     ACMEngine acm_probe;
 
+    // Resolve channel SNR: explicit --snr > --channel-tier > per-tier default
+    auto channel_snr = [&](int modem_tier) -> double {
+        if (force_snr > -900)  return force_snr;
+        if (channel_tier >= 0) return acm_probe.tier(channel_tier).snr_threshold_db + 2.0;
+        return acm_probe.tier(modem_tier).snr_threshold_db + 2.0;
+    };
+
     std::cout << "OpenDSP-OFDM Simulation Test\n";
-    std::cout << "============================\n\n";
+    std::cout << "============================\n";
+    std::cout << "seed: " << seed << "\n";
+    if (channel_tier >= 0)
+        std::cout << "channel: tier " << channel_tier
+                  << " (" << acm_probe.tier(channel_tier).description
+                  << ", SNR=" << std::fixed << std::setprecision(1)
+                  << acm_probe.tier(channel_tier).snr_threshold_db + 2.0 << " dB)\n";
+    std::cout << "\n";
 
     if (force_tier >= 0) {
-        // Single tier test
-        double snr = (force_snr > -900) ? force_snr
-                   : acm_probe.tier(force_tier).snr_threshold_db + 2.0;
+        // Single modem-tier test
+        double snr = channel_snr(force_tier);
         auto r = run_ber_test(force_tier, snr, 1000);
         std::cout << "Tier " << r.tier << " @ SNR=" << snr << " dB\n";
-        std::cout << "  BER=" << std::scientific << r.ber
+        std::cout << "  BER(raw)=" << std::scientific << r.ber
                   << "  errors=" << r.bit_errors << "/" << r.bits_tested
                   << "  throughput~" << std::fixed << (int)r.throughput_bps << " bps\n";
+#ifdef HAVE_CODEC2
+        if (!no_fec) {
+            auto rf = run_fec_ber_test(force_tier, snr, 200);
+            std::cout << "  BER(FEC)=" << std::scientific << rf.fec_ber
+                      << "  code=" << fec_code_for_tier(force_tier) << "\n";
+        }
+#endif
     } else {
         // Full BER sweep
-        std::cout << std::left
-                  << std::setw(6)  << "Tier"
-                  << std::setw(22) << "Description"
-                  << std::setw(10) << "SNR(dB)"
-                  << std::setw(12) << "BER"
-                  << std::setw(14) << "Throughput"
-                  << "\n";
-        std::cout << std::string(64, '-') << "\n";
+#ifdef HAVE_CODEC2
+        bool show_fec = !no_fec;
+#else
+        bool show_fec = false;
+#endif
+        if (show_fec) {
+            std::cout << std::left
+                      << std::setw(6)  << "Tier"
+                      << std::setw(22) << "Description"
+                      << std::setw(10) << "SNR(dB)"
+                      << std::setw(12) << "BER(raw)"
+                      << std::setw(12) << "BER(FEC)"
+                      << std::setw(14) << "Throughput"
+                      << "\n";
+            std::cout << std::string(76, '-') << "\n";
+        } else {
+            std::cout << std::left
+                      << std::setw(6)  << "Tier"
+                      << std::setw(22) << "Description"
+                      << std::setw(10) << "SNR(dB)"
+                      << std::setw(12) << "BER"
+                      << std::setw(14) << "Throughput"
+                      << "\n";
+            std::cout << std::string(64, '-') << "\n";
+        }
 
         for (int t = 0; t < acm_probe.num_tiers(); t++) {
             const auto& tier = acm_probe.tier(t);
-            // Test at threshold + 2 dB (middle of operational range)
-            double snr = tier.snr_threshold_db + 2.0;
+            double snr = channel_snr(t);
             auto r = run_ber_test(t, snr, 300);
 
             std::ostringstream bps_str;
@@ -236,9 +439,15 @@ int main(int argc, char* argv[]) {
                       << std::setw(6)  << t
                       << std::setw(22) << tier.description.substr(0,21)
                       << std::setw(10) << std::fixed << std::setprecision(1) << snr
-                      << std::setw(12) << std::scientific << std::setprecision(2) << r.ber
-                      << std::setw(14) << bps_str.str()
-                      << "\n";
+                      << std::setw(12) << std::scientific << std::setprecision(2) << r.ber;
+
+#ifdef HAVE_CODEC2
+            if (show_fec) {
+                auto rf = run_fec_ber_test(t, snr, 50);
+                std::cout << std::setw(12) << std::scientific << std::setprecision(2) << rf.fec_ber;
+            }
+#endif
+            std::cout << std::setw(14) << bps_str.str() << "\n";
         }
 
         run_negotiation_test();

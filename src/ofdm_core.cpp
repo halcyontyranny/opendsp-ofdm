@@ -33,12 +33,12 @@ cx map_symbol(uint8_t bits, int bps) {
     case 1: { // BPSK: 0→+1, 1→-1
         return (bits & 1) ? cx(-1, 0) : cx(1, 0);
     }
-    case 2: { // QPSK Gray coded, unit power
+    case 2: { // QPSK Gray coded, unit power — MSB→I, LSB→Q
         static const cx qpsk[4] = {
-            {  M_SQRT1_2,  M_SQRT1_2 },
-            { -M_SQRT1_2,  M_SQRT1_2 },
-            {  M_SQRT1_2, -M_SQRT1_2 },
-            { -M_SQRT1_2, -M_SQRT1_2 },
+            {  M_SQRT1_2,  M_SQRT1_2 },  // 00
+            {  M_SQRT1_2, -M_SQRT1_2 },  // 01
+            { -M_SQRT1_2,  M_SQRT1_2 },  // 10
+            { -M_SQRT1_2, -M_SQRT1_2 },  // 11
         };
         return qpsk[bits & 3];
     }
@@ -270,21 +270,21 @@ void OFDMDemodulator::update_channel_estimate(const CxVec& rx_sc,
         for (int i = pilots.back().first; i < p_.num_subcarriers; i++)
             est.h[i] = pilots.back().second;
 
-    // Noise variance: residual at pilot positions after division
-    double noise_sum = 0.0;
-    int    noise_cnt = 0;
-    for (auto& [idx, h_est] : pilots) {
-        cx residual = rx_sc[idx] / (h_est + cx(1e-12, 0)) - cx(1, 0); // should be ≈0
-        noise_sum += std::norm(residual);
-        noise_cnt++;
-    }
-    est.noise_var = noise_cnt > 0 ? noise_sum / noise_cnt : 1e-3;
+    // Noise variance: spread of h_ls values around their mean.
+    // h_ls[k] = h_true + noise_k, so Var(h_ls) = noise_var for flat channels.
+    // This is unbiased and correct regardless of pilot phase (±1).
+    int noise_cnt = static_cast<int>(pilots.size());
+    cx h_mean(0, 0);
+    for (auto& [idx, h_est] : pilots) h_mean += h_est;
+    if (noise_cnt > 0) h_mean /= static_cast<double>(noise_cnt);
 
-    // Signal power (mean over pilots)
-    double sig_pwr = 0.0;
+    double noise_sum = 0.0;
     for (auto& [idx, h_est] : pilots)
-        sig_pwr += std::norm(h_est);
-    sig_pwr = noise_cnt > 0 ? sig_pwr / noise_cnt : 1.0;
+        noise_sum += std::norm(h_est - h_mean);
+    est.noise_var = noise_cnt > 1 ? noise_sum / noise_cnt : 1e-3;
+
+    // Signal power: |h_mean|² (mean channel magnitude squared)
+    double sig_pwr = std::norm(h_mean);
 
     double snr_linear = sig_pwr / (est.noise_var + 1e-12);
     est.snr_db = 10.0 * std::log10(snr_linear + 1e-12);
