@@ -433,14 +433,25 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
+    // Format a bit rate as "X bps" or "X.X kbps"
+    auto fmt_bps = [](double bps) -> std::string {
+        std::ostringstream oss;
+        if (bps >= 1000) oss << std::fixed << std::setprecision(1) << bps/1000.0 << " kbps";
+        else             oss << static_cast<int>(bps) << " bps";
+        return oss.str();
+    };
+
     if (force_tier >= 0) {
         // Single modem-tier test
         double snr = channel_snr(force_tier);
         auto r = run_ber_test(force_tier, snr, 1000);
+        double code_rate = acm_probe.tier(force_tier).rate.value();
+        double gross_bps = code_rate > 0.0 ? r.throughput_bps / code_rate : r.throughput_bps;
         std::cout << "Tier " << r.tier << " @ SNR=" << snr << " dB\n";
         std::cout << "  BER(raw)=" << std::scientific << r.ber
-                  << "  errors=" << r.bit_errors << "/" << r.bits_tested
-                  << "  throughput~" << std::fixed << (int)r.throughput_bps << " bps\n";
+                  << "  errors=" << r.bit_errors << "/" << r.bits_tested << "\n";
+        std::cout << "  gross=" << fmt_bps(gross_bps)
+                  << "  net=" << fmt_bps(r.throughput_bps) << "\n";
 #ifdef HAVE_CODEC2
         if (!no_fec) {
             auto rf = run_fec_ber_test(force_tier, snr, 200);
@@ -463,18 +474,20 @@ int main(int argc, char* argv[]) {
                       << std::setw(10) << "SNR(dB)"
                       << std::setw(12) << "BER(raw)"
                       << std::setw(12) << "BER(FEC)"
-                      << std::setw(14) << "Throughput"
+                      << std::setw(12) << "Gross bps"
+                      << std::setw(11) << "Net bps"
                       << "\n";
-            std::cout << std::string(76, '-') << "\n";
+            std::cout << std::string(85, '-') << "\n";
         } else {
             std::cout << std::left
                       << std::setw(6)  << "Tier"
                       << std::setw(22) << "Description"
                       << std::setw(10) << "SNR(dB)"
                       << std::setw(12) << "BER"
-                      << std::setw(14) << "Throughput"
+                      << std::setw(12) << "Gross bps"
+                      << std::setw(11) << "Net bps"
                       << "\n";
-            std::cout << std::string(64, '-') << "\n";
+            std::cout << std::string(73, '-') << "\n";
         }
 
         for (int t = 0; t < acm_probe.num_tiers(); t++) {
@@ -482,11 +495,8 @@ int main(int argc, char* argv[]) {
             double snr = channel_snr(t);
             auto r = run_ber_test(t, snr, 300);
 
-            std::ostringstream bps_str;
-            if (r.throughput_bps >= 1000)
-                bps_str << std::fixed << std::setprecision(1) << r.throughput_bps/1000.0 << " kbps";
-            else
-                bps_str << (int)r.throughput_bps << " bps";
+            double code_rate = tier.rate.value();
+            double gross_bps = code_rate > 0.0 ? r.throughput_bps / code_rate : r.throughput_bps;
 
             std::cout << std::left
                       << std::setw(6)  << t
@@ -500,7 +510,8 @@ int main(int argc, char* argv[]) {
                 std::cout << std::setw(12) << std::scientific << std::setprecision(2) << rf.fec_ber;
             }
 #endif
-            std::cout << std::setw(14) << bps_str.str() << "\n";
+            std::cout << std::setw(12) << fmt_bps(gross_bps)
+                      << std::setw(11) << fmt_bps(r.throughput_bps) << "\n";
         }
 
         run_negotiation_test();
