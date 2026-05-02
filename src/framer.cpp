@@ -51,13 +51,15 @@ uint32_t Framer::crc32(const std::vector<uint8_t>& data) {
 
 // ── Build ─────────────────────────────────────────────────────────────────────
 
-std::vector<uint8_t> Framer::build(const Frame& f) const {
+std::vector<uint8_t> Framer::build(const Frame& f, int target_bytes) const {
     std::vector<uint8_t> raw;
 
-    // ACM header (3 bytes)
+    // ACM header (5 bytes); payload_len auto-derived from actual payload size
     raw.push_back(f.header.tier_index);
     raw.push_back(f.header.max_bw_code);
     raw.push_back(static_cast<uint8_t>(f.header.frame_type));
+    raw.push_back(f.header.num_blocks);
+    raw.push_back(static_cast<uint8_t>(f.payload.size()));
 
     // Callsign (7 bytes, null-padded)
     char cs[CALLSIGN_BYTES] = {};
@@ -67,7 +69,13 @@ std::vector<uint8_t> Framer::build(const Frame& f) const {
     // Payload
     for (uint8_t b : f.payload) raw.push_back(b);
 
-    // CRC-32 over everything so far
+    // Zero-pad to (target_bytes - CRC32_BYTES) so CRC is always the last 4 bytes
+    if (target_bytes > 0) {
+        int pad_target = target_bytes - CRC32_BYTES;
+        while (static_cast<int>(raw.size()) < pad_target) raw.push_back(0);
+    }
+
+    // CRC-32 (always last 4 bytes, covers header + callsign + payload + padding)
     uint32_t crc = crc32(raw);
     raw.push_back((crc >> 24) & 0xFF);
     raw.push_back((crc >> 16) & 0xFF);
@@ -90,14 +98,18 @@ Frame Framer::parse(const std::vector<uint8_t>& raw) const {
     f.header.tier_index   = raw[pos++];
     f.header.max_bw_code  = raw[pos++];
     f.header.frame_type   = static_cast<FrameType>(raw[pos++]);
+    f.header.num_blocks   = raw[pos++];
+    f.header.payload_len  = raw[pos++];
 
     char cs[CALLSIGN_BYTES + 1] = {};
     for (int i = 0; i < CALLSIGN_BYTES; i++) cs[i] = static_cast<char>(raw[pos++]);
     f.callsign = std::string(cs);
 
-    // Payload = everything between callsign and CRC
+    // Extract exactly payload_len bytes; ignore zero-padding between payload and CRC
     size_t payload_end = raw.size() - CRC32_BYTES;
-    for (size_t i = pos; i < payload_end; i++) f.payload.push_back(raw[i]);
+    size_t plen = f.header.payload_len;
+    if (pos + plen > payload_end) plen = payload_end - pos;
+    for (size_t i = 0; i < plen; i++) f.payload.push_back(raw[pos + i]);
 
     // Verify CRC
     std::vector<uint8_t> body(raw.begin(), raw.begin() + payload_end);
@@ -119,6 +131,7 @@ Frame Framer::make_probe(const std::string& callsign, int our_max_tier) const {
     f.header.tier_index  = 0;  // Always probe at minimum tier
     f.header.max_bw_code = static_cast<uint8_t>(our_max_tier);
     f.header.frame_type  = FrameType::PROBE;
+    f.header.num_blocks  = 1;
     f.callsign           = callsign;
     return f;
 }
@@ -130,6 +143,7 @@ Frame Framer::make_ack(const std::string& callsign,
     f.header.tier_index  = static_cast<uint8_t>(agreed_tier);
     f.header.max_bw_code = static_cast<uint8_t>(our_max_tier);
     f.header.frame_type  = FrameType::ACK;
+    f.header.num_blocks  = 1;
     f.callsign           = callsign;
     // Encode agreed tier in payload byte 0 for redundancy
     f.payload.push_back(static_cast<uint8_t>(agreed_tier));
@@ -141,6 +155,7 @@ Frame Framer::make_retune(const std::string& callsign, int new_tier) const {
     f.header.tier_index  = static_cast<uint8_t>(new_tier);
     f.header.max_bw_code = 0;
     f.header.frame_type  = FrameType::RETUNE;
+    f.header.num_blocks  = 1;
     f.callsign           = callsign;
     f.payload.push_back(static_cast<uint8_t>(new_tier));
     return f;
@@ -151,6 +166,7 @@ Frame Framer::make_nak(const std::string& callsign) const {
     f.header.tier_index  = 0;
     f.header.max_bw_code = 0;
     f.header.frame_type  = FrameType::NAK;
+    f.header.num_blocks  = 1;
     f.callsign           = callsign;
     return f;
 }

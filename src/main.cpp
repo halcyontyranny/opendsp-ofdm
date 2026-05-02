@@ -94,13 +94,43 @@ public:
                     bool parity_ok = accum_->decode(decoded_bits);
                     accum_->reset();
                     auto decoded_bytes = bits_to_bytes(decoded_bits);
-                    Framer framer;
-                    Frame  frame = framer.parse(decoded_bytes);
-                    if (frame.crc_ok) {
-                        std::cout << "\n[RX] " << frame.callsign << ": ";
-                        for (auto b : frame.payload)
-                            std::cout << static_cast<char>(b);
-                        std::cout << " [FEC:" << (parity_ok ? "OK" : "err") << "]\n";
+
+                    // First block of a new frame: read num_blocks from header byte 3
+                    if (blocks_received_ == 0 && decoded_bytes.size() > 3) {
+                        expected_blocks_ = decoded_bytes[3];
+                        if (expected_blocks_ == 0) expected_blocks_ = 1;
+                        if (expected_blocks_ > 1) {
+                            // Estimate reception duration for half-duplex awareness
+                            int sym_len    = params_.fft_size + params_.cp_len;
+                            int data_sc    = params_.num_subcarriers
+                                           - params_.num_subcarriers / params_.pilot_interval;
+                            int bps        = data_sc * params_.bits_per_symbol;
+                            int np         = passes_for_tier(acm_.state().tier_index);
+                            int syms       = (accum_->coded_bits() + bps - 1) / bps;
+                            double rx_secs = expected_blocks_ * np * syms
+                                           * static_cast<double>(sym_len) / SAMPLE_RATE;
+                            std::cout << "\n[RX] " << expected_blocks_ << "-block frame (~"
+                                      << std::fixed << std::setprecision(1) << rx_secs
+                                      << " s) — hold TX\n";
+                        }
+                    }
+
+                    block_buf_.insert(block_buf_.end(),
+                                      decoded_bytes.begin(), decoded_bytes.end());
+                    blocks_received_++;
+
+                    if (blocks_received_ >= expected_blocks_) {
+                        Framer framer;
+                        Frame  frame = framer.parse(block_buf_);
+                        if (frame.crc_ok) {
+                            std::cout << "\n[RX] " << frame.callsign << ": ";
+                            for (auto b : frame.payload)
+                                std::cout << static_cast<char>(b);
+                            std::cout << " [FEC:" << (parity_ok ? "OK" : "err") << "]\n";
+                        }
+                        block_buf_.clear();
+                        blocks_received_ = 0;
+                        expected_blocks_ = 1;
                     }
                 }
             }
@@ -142,6 +172,9 @@ private:
 #ifdef HAVE_CODEC2
     std::unique_ptr<FECAccumulator> accum_;
     std::vector<float>              pass_llrs_;
+    std::vector<uint8_t>            block_buf_;
+    int                             blocks_received_ = 0;
+    int                             expected_blocks_ = 1;
 #endif
 
     void update_params() {
@@ -153,6 +186,9 @@ private:
         accum_ = std::make_unique<FECAccumulator>(fec_code_for_tier(tier),
                                                    passes_for_tier(tier));
         pass_llrs_.clear();
+        block_buf_.clear();
+        blocks_received_ = 0;
+        expected_blocks_ = 1;
 #endif
     }
 };
@@ -174,29 +210,38 @@ std::vector<double> build_tx_frame(const std::string& text,
     f.callsign           = callsign;
     for (char c : text) f.payload.push_back(static_cast<uint8_t>(c));
 
-    auto raw_bytes = framer.build(f);
-
     // Convert bytes to bits (MSB first)
     std::vector<uint8_t> bits;
 #ifdef HAVE_CODEC2
-    bits = bytes_to_bits(raw_bytes);
+    {
+        int num_passes   = passes_for_tier(acm.state().tier_index);
+        FECCodec fec(fec_code_for_tier(acm.state().tier_index));
+        int block_bytes   = fec.data_bits() / 8;
+        int content_bytes = ACM_HDR_BYTES + CALLSIGN_BYTES
+                          + static_cast<int>(f.payload.size()) + CRC32_BYTES;
+        int num_blocks    = (content_bytes + block_bytes - 1) / block_bytes;
+        int target_bytes  = num_blocks * block_bytes;
 
-    // FEC encode: pad to block boundary, encode each block, repeat num_passes times
-    int num_passes = passes_for_tier(acm.state().tier_index);
-    FECCodec fec(fec_code_for_tier(acm.state().tier_index));
-    auto padded = fec.pad_to_block(bits);
-    bits.clear();
-    for (int off = 0; off < static_cast<int>(padded.size()); off += fec.data_bits()) {
-        std::vector<uint8_t> block(padded.begin() + off,
-                                    padded.begin() + off + fec.data_bits());
-        auto codeword = fec.encode(block);
-        for (int p = 0; p < num_passes; p++)
-            bits.insert(bits.end(), codeword.begin(), codeword.end());
+        f.header.num_blocks = static_cast<uint8_t>(num_blocks);
+        auto raw_bytes = framer.build(f, target_bytes);
+        auto all_bits  = bytes_to_bits(raw_bytes);
+
+        for (int off = 0; off < static_cast<int>(all_bits.size()); off += fec.data_bits()) {
+            std::vector<uint8_t> block(all_bits.begin() + off,
+                                        all_bits.begin() + off + fec.data_bits());
+            auto codeword = fec.encode(block);
+            for (int p = 0; p < num_passes; p++)
+                bits.insert(bits.end(), codeword.begin(), codeword.end());
+        }
     }
 #else
-    for (uint8_t byte : raw_bytes)
-        for (int b = 7; b >= 0; b--)
-            bits.push_back((byte >> b) & 1);
+    {
+        f.header.num_blocks = 1;
+        auto raw_bytes = framer.build(f);
+        for (uint8_t byte : raw_bytes)
+            for (int b = 7; b >= 0; b--)
+                bits.push_back((byte >> b) & 1);
+    }
 #endif
 
     // Pad coded bit stream to fill an integer number of OFDM symbols

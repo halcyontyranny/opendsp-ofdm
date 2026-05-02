@@ -8,16 +8,23 @@ namespace opendsp {
 
 // ── Frame field sizes (bytes) ─────────────────────────────────────────────────
 //
-//  | SYNC (ZC, time-domain) | PILOT OFDM sym | ACM_HDR 3B | PAYLOAD NB | CRC-32 4B |
+//  FEC block layout (size = fec.data_bits()/8 per block):
+//  | ACM_HDR 5B | CALLSIGN 7B | PAYLOAD NB | ZERO-PAD KB | CRC-32 4B |
 //
-//  ACM_HDR: [tier_index 4b | reserved 4b | max_bw_code 8b | flags 8b]
-//  PAYLOAD: variable, determined by tier
+//  ACM_HDR (5 bytes):
+//    [tier_index 8b][max_bw_code 8b][frame_type 8b][num_blocks 8b][payload_len 8b]
+//
+//  num_blocks : total FEC blocks in this transmission (receiver holds TX for this long)
+//  payload_len: valid payload bytes in this message (remainder of block is zero-padding)
+//
+//  CRC-32 covers all bytes preceding it (header + callsign + payload + padding).
+//  Zero-padding keeps each FEC block at an exact fec.data_bits()/8 byte boundary.
 
-static constexpr int ACM_HDR_BYTES  = 3;
+static constexpr int ACM_HDR_BYTES  = 5;
 static constexpr int CRC32_BYTES    = 4;
 static constexpr int CALLSIGN_BYTES = 7;   // up to 6 chars + null
 
-// Frame type flags (carried in ACM_HDR flags byte)
+// Frame type (carried in ACM_HDR frame_type byte)
 enum class FrameType : uint8_t {
     DATA    = 0x00,
     PROBE   = 0x01,   // Bandwidth negotiation probe
@@ -27,12 +34,14 @@ enum class FrameType : uint8_t {
     BEACON  = 0x05,   // Periodic beacon / ID
 };
 
-// ── ACM header (packed into 3 bytes) ─────────────────────────────────────────
+// ── ACM header (5 bytes on-air) ───────────────────────────────────────────────
 
 struct ACMHeader {
-    uint8_t   tier_index;     // Sender's current tier
-    uint8_t   max_bw_code;    // Sender's maximum supported BW (index into tier table)
+    uint8_t   tier_index;   // Sender's current tier
+    uint8_t   max_bw_code;  // Sender's maximum supported BW (index into tier table)
     FrameType frame_type;
+    uint8_t   num_blocks;   // Total FEC blocks in this transmission (1 = single block)
+    uint8_t   payload_len;  // Valid payload bytes (set automatically by build())
 };
 
 // ── Frame ─────────────────────────────────────────────────────────────────────
@@ -50,7 +59,8 @@ struct Frame {
 class Framer {
 public:
     // Build a complete byte-stream for a DATA frame.
-    std::vector<uint8_t> build(const Frame& f) const;
+    // target_bytes: if > 0, zero-pads between payload and CRC to fill exactly that many bytes.
+    std::vector<uint8_t> build(const Frame& f, int target_bytes = 0) const;
 
     // Parse a byte-stream into a Frame; sets frame.crc_ok.
     Frame parse(const std::vector<uint8_t>& raw) const;
