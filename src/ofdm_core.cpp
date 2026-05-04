@@ -133,9 +133,32 @@ OFDMModulator::OFDMModulator(const OFDMParams& p) : p_(p) {
 }
 
 OFDMModulator::~OFDMModulator() {
-    fftw_destroy_plan(ifft_plan_);
+    if (ifft_plan_) fftw_destroy_plan(ifft_plan_);
     fftw_free(fft_in_);
     fftw_free(fft_out_);
+}
+
+OFDMModulator::OFDMModulator(OFDMModulator&& o) noexcept
+    : p_(o.p_), ifft_plan_(o.ifft_plan_), fft_in_(o.fft_in_), fft_out_(o.fft_out_) {
+    o.ifft_plan_ = nullptr;
+    o.fft_in_    = nullptr;
+    o.fft_out_   = nullptr;
+}
+
+OFDMModulator& OFDMModulator::operator=(OFDMModulator&& o) noexcept {
+    if (this != &o) {
+        if (ifft_plan_) fftw_destroy_plan(ifft_plan_);
+        fftw_free(fft_in_);
+        fftw_free(fft_out_);
+        p_         = o.p_;
+        ifft_plan_ = o.ifft_plan_;
+        fft_in_    = o.fft_in_;
+        fft_out_   = o.fft_out_;
+        o.ifft_plan_ = nullptr;
+        o.fft_in_    = nullptr;
+        o.fft_out_   = nullptr;
+    }
+    return *this;
 }
 
 void OFDMModulator::insert_pilots(CxVec& sc, int sym_idx) const {
@@ -207,9 +230,34 @@ OFDMDemodulator::OFDMDemodulator(const OFDMParams& p) : p_(p) {
 }
 
 OFDMDemodulator::~OFDMDemodulator() {
-    fftw_destroy_plan(fft_plan_);
+    if (fft_plan_) fftw_destroy_plan(fft_plan_);
     fftw_free(fft_in_);
     fftw_free(fft_out_);
+}
+
+OFDMDemodulator::OFDMDemodulator(OFDMDemodulator&& o) noexcept
+    : p_(o.p_), fft_plan_(o.fft_plan_), fft_in_(o.fft_in_), fft_out_(o.fft_out_),
+      pilot_refs_(std::move(o.pilot_refs_)) {
+    o.fft_plan_ = nullptr;
+    o.fft_in_   = nullptr;
+    o.fft_out_  = nullptr;
+}
+
+OFDMDemodulator& OFDMDemodulator::operator=(OFDMDemodulator&& o) noexcept {
+    if (this != &o) {
+        if (fft_plan_) fftw_destroy_plan(fft_plan_);
+        fftw_free(fft_in_);
+        fftw_free(fft_out_);
+        p_          = o.p_;
+        fft_plan_   = o.fft_plan_;
+        fft_in_     = o.fft_in_;
+        fft_out_    = o.fft_out_;
+        pilot_refs_ = std::move(o.pilot_refs_);
+        o.fft_plan_ = nullptr;
+        o.fft_in_   = nullptr;
+        o.fft_out_  = nullptr;
+    }
+    return *this;
 }
 
 void OFDMDemodulator::generate_pilot_refs() {

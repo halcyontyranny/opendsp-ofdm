@@ -55,6 +55,10 @@ class OFDMModulator {
 public:
     explicit OFDMModulator(const OFDMParams& p);
     ~OFDMModulator();
+    OFDMModulator(OFDMModulator&&) noexcept;
+    OFDMModulator& operator=(OFDMModulator&&) noexcept;
+    OFDMModulator(const OFDMModulator&) = delete;
+    OFDMModulator& operator=(const OFDMModulator&) = delete;
 
     // Modulate one OFDM symbol from a vector of complex subcarrier values.
     // Returns time-domain samples (FFT_size + CP_len samples).
@@ -88,6 +92,10 @@ class OFDMDemodulator {
 public:
     explicit OFDMDemodulator(const OFDMParams& p);
     ~OFDMDemodulator();
+    OFDMDemodulator(OFDMDemodulator&&) noexcept;
+    OFDMDemodulator& operator=(OFDMDemodulator&&) noexcept;
+    OFDMDemodulator(const OFDMDemodulator&) = delete;
+    OFDMDemodulator& operator=(const OFDMDemodulator&) = delete;
 
     // Remove cyclic prefix and run FFT.
     // input: exactly (fft_size + cp_len) real samples.

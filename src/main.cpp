@@ -12,7 +12,9 @@
 
 #include <iostream>
 #include <iomanip>
+#include <sstream>
 #include <string>
+#include <ctime>
 #include <csignal>
 #include <atomic>
 #include <thread>
@@ -38,9 +40,15 @@ void sig_handler(int) { g_running = false; }
 class RXPipeline {
 public:
     RXPipeline(ACMEngine& acm, bool verbose)
-        : acm_(acm), verbose_(verbose) {
-        update_params();
+        : acm_(acm), verbose_(verbose),
+          params_(acm.current_params()),
+          demod_(params_) {
         zc_ref_ = zadoff_chu(params_.fft_size / 4);
+#ifdef HAVE_CODEC2
+        int tier = acm_.state().tier_index;
+        accum_ = std::make_unique<FECAccumulator>(fec_code_for_tier(tier),
+                                                   passes_for_tier(tier));
+#endif
     }
 
     void on_samples(const std::vector<double>& samples) {
@@ -100,18 +108,22 @@ public:
                         expected_blocks_ = decoded_bytes[3];
                         if (expected_blocks_ == 0) expected_blocks_ = 1;
                         if (expected_blocks_ > 1) {
-                            // Estimate reception duration for half-duplex awareness
-                            int sym_len    = params_.fft_size + params_.cp_len;
-                            int data_sc    = params_.num_subcarriers
-                                           - params_.num_subcarriers / params_.pilot_interval;
-                            int bps        = data_sc * params_.bits_per_symbol;
-                            int np         = passes_for_tier(acm_.state().tier_index);
-                            int syms       = (accum_->coded_bits() + bps - 1) / bps;
-                            double rx_secs = expected_blocks_ * np * syms
-                                           * static_cast<double>(sym_len) / SAMPLE_RATE;
-                            std::cout << "\n[RX] " << expected_blocks_ << "-block frame (~"
-                                      << std::fixed << std::setprecision(1) << rx_secs
-                                      << " s) — hold TX\n";
+                            int sym_len = params_.fft_size + params_.cp_len;
+                            int data_sc = params_.num_subcarriers
+                                        - params_.num_subcarriers / params_.pilot_interval;
+                            int bps     = data_sc * params_.bits_per_symbol;
+                            int np      = passes_for_tier(acm_.state().tier_index);
+                            if (bps > 0) {
+                                int    syms    = (accum_->coded_bits() + bps - 1) / bps;
+                                double rx_secs = expected_blocks_ * np * syms
+                                               * static_cast<double>(sym_len) / SAMPLE_RATE;
+                                clear_status();
+                                std::cout << utc_now() << "  [multi-block: "
+                                          << expected_blocks_ << " blk · ~"
+                                          << std::fixed << std::setprecision(1) << rx_secs
+                                          << " s · hold TX]\n";
+                                redraw_status();
+                            }
                         }
                     }
 
@@ -122,12 +134,8 @@ public:
                     if (blocks_received_ >= expected_blocks_) {
                         Framer framer;
                         Frame  frame = framer.parse(block_buf_);
-                        if (frame.crc_ok) {
-                            std::cout << "\n[RX] " << frame.callsign << ": ";
-                            for (auto b : frame.payload)
-                                std::cout << static_cast<char>(b);
-                            std::cout << " [FEC:" << (parity_ok ? "OK" : "err") << "]\n";
-                        }
+                        if (frame.crc_ok)
+                            print_frame(frame, parity_ok, blocks_received_);
                         block_buf_.clear();
                         blocks_received_ = 0;
                         expected_blocks_ = 1;
@@ -142,17 +150,18 @@ public:
 #endif
 
             // Feed SNR to ACM
+            int  old_tier     = acm_.state().tier_index;
             bool tier_changed = acm_.update(ch_est_.snr_db, 0.0 /* BER TBD */);
             if (tier_changed) {
-                std::cout << "\n[ACM] " << acm_.status_string() << "\n";
+                clear_status();
+                std::cout << "[ACM] T" << old_tier << " -> T" << acm_.state().tier_index
+                          << ": " << acm_.current_tier().description
+                          << "  (" << std::fixed << std::setprecision(1)
+                          << ch_est_.snr_db << " dB)\n";
                 update_params();
             }
 
-            if (verbose_)
-                std::cout << "\r[RX] sym=" << sym_count_
-                          << " SNR=" << std::fixed << std::setprecision(1)
-                          << ch_est_.snr_db << " dB  "
-                          << acm_.status_string() << std::flush;
+            redraw_status();
 
             sym_count_++;
             sample_buf_.erase(sample_buf_.begin(),
@@ -164,11 +173,12 @@ private:
     ACMEngine&      acm_;
     bool            verbose_;
     OFDMParams      params_;
-    OFDMDemodulator demod_{params_};
+    OFDMDemodulator demod_;
     ChannelEstimate ch_est_;
     CxVec           zc_ref_;
     RealVec         sample_buf_;
-    int             sym_count_ = 0;
+    int             sym_count_    = 0;
+    int             status_width_ = 0;
 #ifdef HAVE_CODEC2
     std::unique_ptr<FECAccumulator> accum_;
     std::vector<float>              pass_llrs_;
@@ -176,6 +186,55 @@ private:
     int                             blocks_received_ = 0;
     int                             expected_blocks_ = 1;
 #endif
+
+    static std::string utc_now() {
+        auto t = std::time(nullptr);
+        char buf[16];
+        std::strftime(buf, sizeof(buf), "%H:%M:%S", std::gmtime(&t));
+        return {buf};
+    }
+
+    void clear_status() {
+        if (status_width_ > 0) {
+            std::cout << '\r' << std::string(status_width_, ' ') << '\r';
+            status_width_ = 0;
+        }
+    }
+
+    void redraw_status() {
+        std::ostringstream ss;
+        ss << "[RX] " << std::fixed << std::setprecision(1) << ch_est_.snr_db
+           << " dB  T" << acm_.state().tier_index
+           << ": " << acm_.current_tier().description;
+        if (verbose_)
+            ss << "  sym=" << sym_count_;
+        auto line = ss.str();
+        status_width_ = static_cast<int>(line.size());
+        std::cout << '\r' << line << std::flush;
+    }
+
+    void print_frame(const Frame& frame, bool parity_ok, int num_blocks) {
+        clear_status();
+        std::ostringstream ss;
+        ss << utc_now() << "  " << frame.callsign << "  ";
+        if (frame.header.frame_type == FrameType::DATA
+         || frame.header.frame_type == FrameType::BEACON) {
+            for (auto b : frame.payload)
+                ss << static_cast<char>(b);
+        } else {
+            static const char* names[] = {"DATA","PROBE","ACK","RETUNE","NAK","BEACON"};
+            auto idx = static_cast<uint8_t>(frame.header.frame_type);
+            ss << '[' << (idx < 6 ? names[idx] : "?") << ']';
+        }
+        ss << "  [T" << static_cast<int>(frame.header.tier_index)
+           << " · " << std::fixed << std::setprecision(1) << ch_est_.snr_db << " dB"
+           << " · FEC:" << (parity_ok ? "OK" : "err");
+        if (num_blocks > 1)
+            ss << " · " << num_blocks << " blk";
+        ss << ']';
+        std::cout << ss.str() << '\n';
+        redraw_status();
+    }
 
     void update_params() {
         params_ = acm_.current_params();
